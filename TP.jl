@@ -277,9 +277,6 @@ md"""
 - ...
 """
 
-# ╔═╡ 3a3f0805-b720-411c-ad2b-4c311860e06d
-
-
 # ╔═╡ 87040fd6-bd1a-47dd-875c-2caf5b50d2ce
 md"""
 ## Smoothing by regularization
@@ -740,6 +737,71 @@ md"""
 In the following cell, we define utility plot functions to have a glimpse at images, cell costs and paths. Their implementation is not at the core of this tutorial, they are thus hidden.
 """
 
+# ╔═╡ 08ea0d7e-2ffe-4f2e-bd8c-f15f9af0f35b
+begin 
+	"""
+	    convert_image_for_plot(image::Array{Float32,3})::Array{RGB{N0f8},2}
+	Convert `image` to the proper data format to enable plots in Julia.
+	"""
+	function convert_image_for_plot(image::Array{Float32,3})::Array{RGB{N0f8},2}
+	    new_img = Array{RGB{N0f8},2}(undef, size(image)[1], size(image)[2])
+	    for i = 1:size(image)[1]
+	        for j = 1:size(image)[2]
+	            new_img[i,j] = RGB{N0f8}(image[i,j,1], image[i,j,2], image[i,j,3])
+	        end
+	    end
+	    return new_img
+	end
+	
+	"""
+		plot_image_weights_path(;im, weights, path)
+	Plot the image `im`, the weights `weights`, and the path `path` on the same Figure.
+	"""
+	function plot_image_weights_path(x, y, θ; θ_title="Weights", y_title="Path", θ_true=θ)
+		im = dropdims(x; dims=4)
+		img = convert_image_for_plot(im)
+	    p1 = Plots.plot(
+	        img;
+	        aspect_ratio=:equal,
+	        framestyle=:none,
+	        size=(300, 300),
+			title="Terrain image"
+	    )
+		p2 = Plots.heatmap(
+			θ;
+			yflip=true,
+			aspect_ratio=:equal,
+			framestyle=:none,
+			padding=(0., 0.),
+			size=(300, 300),
+			legend=false,
+			title=θ_title,
+			clim=(minimum(θ_true), maximum(θ_true))
+		)
+		p3 = Plots.plot(
+	        Gray.(y .* 0.7);
+	        aspect_ratio=:equal,
+	        framestyle=:none,
+	        size=(300, 300),
+			title=y_title
+	    )
+	    plot(p1, p2, p3, layout = (1, 3), size = (900, 300))
+	end
+	
+	"""
+	    plot_loss_and_gap(losses::Matrix{Float64}, gaps::Matrix{Float64},  options::NamedTuple; filepath=nothing)
+	
+	Plot the train and test losses, as well as the train and test gaps computed over epochs.
+	"""
+	function plot_loss_and_gap(losses::Matrix{Float64}, gaps::Matrix{Float64},nb_epochs; filepath=nothing)
+	    p1 = plot(collect(1:nb_epochs), losses, title = "Loss", xlabel = "epochs", ylabel = "loss", label = ["train" "test"])
+	    p2 = plot(collect(0:nb_epochs), gaps, title = "Gap", xlabel = "epochs", ylabel = "ratio", label = ["train" "test"])
+	    pl = plot(p1, p2, layout = (1, 2))
+	    isnothing(filepath) || Plots.savefig(pl, filepath)
+	    return pl
+	end
+end;
+
 # ╔═╡ d58098e8-bba5-445c-b1c3-bfb597789916
 md"""
 ### d) Import and explore the dataset
@@ -771,6 +833,9 @@ We can have a glimpse at the dataset, use the slider to visualize each tuple (im
 md"""
 ``n =`` $(@bind n Slider(1:length(dataset); default=1, show_value=true))
 """
+
+# ╔═╡ 828869da-0a1f-4a26-83ba-78e7a31f5eb9
+plot_image_weights_path(dataset[n]...)
 
 # ╔═╡ fa62a7b3-8f17-42a3-8428-b2ac7eae737a
 md"""
@@ -1091,6 +1156,49 @@ md"""
 The following block defines the generic learning function.
 """
 
+# ╔═╡ a6a56523-90c9-40d2-9b68-26e20c1a5527
+function train_function!(;
+	encoder, loss, train_data, test_data, lr_start, nb_epoch, batch_size, maximizer
+)
+	# batch stuff
+	batch_loss(batch) = sum(loss(item...) for item in batch)
+	train_dataset = Flux.DataLoader(train_data; batchsize=batch_size)
+	test_dataset = Flux.DataLoader(test_data; batchsize=length(test_data))
+
+	# Store the train loss and gap metric
+	losses = Matrix{Float64}(undef, nb_epoch, 2)
+	cost_gaps = Matrix{Float64}(undef, nb_epoch + 1, 2)
+
+	# Optimizer
+	opt = ADAM(lr_start)
+
+	# model parameters
+	par = Flux.params(encoder)
+
+	cost_gaps[1, 1] = shortest_path_cost_gap(; model=encoder, dataset=train_dataset, maximizer)
+	cost_gaps[1, 2] = shortest_path_cost_gap(; model=encoder, dataset=test_dataset, maximizer)
+
+	# Train loop
+	@progress "Training epoch: " for epoch in 1:nb_epoch
+		train_loss = 0.0
+		for batch in train_dataset
+			loss_value = 0
+			gs = gradient(par) do
+				loss_value = batch_loss(batch)
+			end
+			train_loss += loss_value
+			Flux.update!(opt, par, gs)
+		end
+
+		# compute and store epoch metrics
+		losses[epoch, 1] = train_loss / (nb_samples * train_prop)
+		losses[epoch, 2] = sum([batch_loss(batch) for batch in test_dataset]) / (nb_samples * (1 - train_prop))
+		cost_gaps[epoch + 1, 1] = shortest_path_cost_gap(; model=encoder, dataset=train_dataset, maximizer)
+		cost_gaps[epoch + 1, 2] = shortest_path_cost_gap(; model=encoder, dataset=test_dataset, maximizer)
+	end
+	 return losses, cost_gaps, deepcopy(encoder)
+end
+
 # ╔═╡ 920d94cd-bfb5-4c02-baa3-f346d5c95e2e
 md"""
 ## IV - Pipelines
@@ -1136,123 +1244,10 @@ We first define the hyper-parameters for the learning process. They include:
 begin
 	ε = 0.1
 	M = 10
-	nb_epochs = 20
+	nb_epochs = 40
 	batch_size = 80
 	lr_start = 1e-3
 end;
-
-# ╔═╡ 08ea0d7e-2ffe-4f2e-bd8c-f15f9af0f35b
-begin 
-	"""
-	    convert_image_for_plot(image::Array{Float32,3})::Array{RGB{N0f8},2}
-	Convert `image` to the proper data format to enable plots in Julia.
-	"""
-	function convert_image_for_plot(image::Array{Float32,3})::Array{RGB{N0f8},2}
-	    new_img = Array{RGB{N0f8},2}(undef, size(image)[1], size(image)[2])
-	    for i = 1:size(image)[1]
-	        for j = 1:size(image)[2]
-	            new_img[i,j] = RGB{N0f8}(image[i,j,1], image[i,j,2], image[i,j,3])
-	        end
-	    end
-	    return new_img
-	end
-	
-	"""
-		plot_image_weights_path(;im, weights, path)
-	Plot the image `im`, the weights `weights`, and the path `path` on the same Figure.
-	"""
-	function plot_image_weights_path(x, y, θ; θ_title="Weights", y_title="Path", θ_true=θ)
-		im = dropdims(x; dims=4)
-		img = convert_image_for_plot(im)
-	    p1 = Plots.plot(
-	        img;
-	        aspect_ratio=:equal,
-	        framestyle=:none,
-	        size=(300, 300),
-			title="Terrain image"
-	    )
-		p2 = Plots.heatmap(
-			θ;
-			yflip=true,
-			aspect_ratio=:equal,
-			framestyle=:none,
-			padding=(0., 0.),
-			size=(300, 300),
-			legend=false,
-			title=θ_title,
-			clim=(minimum(θ_true), maximum(θ_true))
-		)
-		p3 = Plots.plot(
-	        Gray.(y .* 0.7);
-	        aspect_ratio=:equal,
-	        framestyle=:none,
-	        size=(300, 300),
-			title=y_title
-	    )
-	    plot(p1, p2, p3, layout = (1, 3), size = (900, 300))
-	end
-	
-	"""
-	    plot_loss_and_gap(losses::Matrix{Float64}, gaps::Matrix{Float64},  options::NamedTuple; filepath=nothing)
-	
-	Plot the train and test losses, as well as the train and test gaps computed over epochs.
-	"""
-	function plot_loss_and_gap(losses::Matrix{Float64}, gaps::Matrix{Float64}; filepath=nothing)
-	    p1 = plot(collect(1:nb_epochs), losses, title = "Loss", xlabel = "epochs", ylabel = "loss", label = ["train" "test"])
-	    p2 = plot(collect(0:nb_epochs), gaps, title = "Gap", xlabel = "epochs", ylabel = "ratio", label = ["train" "test"])
-	    pl = plot(p1, p2, layout = (1, 2))
-	    isnothing(filepath) || Plots.savefig(pl, filepath)
-	    return pl
-	end
-end;
-
-# ╔═╡ 828869da-0a1f-4a26-83ba-78e7a31f5eb9
-plot_image_weights_path(dataset[n]...)
-
-# ╔═╡ a6a56523-90c9-40d2-9b68-26e20c1a5527
-function train_function!(;
-	encoder, loss, train_data, test_data, lr_start, nb_epoch, batch_size, maximizer
-)
-	# batch stuff
-	batch_loss(batch) = sum(loss(item...) for item in batch)
-	train_dataset = Flux.DataLoader(train_data; batchsize=batch_size)
-	test_dataset = Flux.DataLoader(test_data; batchsize=length(test_data))
-
-	# Store the train loss and gap metric
-	losses = Matrix{Float64}(undef, nb_epochs, 2)
-	cost_gaps = Matrix{Float64}(undef, nb_epochs + 1, 2)
-
-	# Optimizer
-	opt = ADAM(lr_start)
-
-	# model parameters
-	par = Flux.params(encoder)
-
-	cost_gaps[1, 1] = shortest_path_cost_gap(; model=encoder, dataset=train_dataset, maximizer)
-	cost_gaps[1, 2] = shortest_path_cost_gap(; model=encoder, dataset=test_dataset, maximizer)
-
-	# Train loop
-	@progress "Training epoch: " for epoch in 1:nb_epochs
-		train_loss = 0.0
-		for batch in train_dataset
-			@info "" j=1
-			loss_value = 0
-			gs = gradient(par) do
-				loss_value = batch_loss(batch)
-			end
-			train_loss += loss_value
-			Flux.update!(opt, par, gs)
-			@info "" j=2
-		end
-
-		# compute and store epoch metrics
-		losses[epoch, 1] = train_loss / (nb_samples * train_prop)
-		losses[epoch, 2] = sum([batch_loss(batch) for batch in test_dataset]) / (nb_samples * (1 - train_prop))
-		cost_gaps[epoch + 1, 1] = shortest_path_cost_gap(; model=encoder, dataset=train_dataset, maximizer)
-		cost_gaps[epoch + 1, 2] = shortest_path_cost_gap(; model=encoder, dataset=test_dataset, maximizer)
-	end
-	 return losses, cost_gaps, deepcopy(encoder)
-end
 
 # ╔═╡ 677f20f9-61ed-46ed-af65-73af73f7af7d
 tip(md"Feel free to play around with hyperparameters, observe and report their impact on the training performances.")
@@ -1277,25 +1272,16 @@ md"""
 md"As already seen in the previous sections, we wrap our shortest path algorithm in a `PerturbedAdditive`"
 
 # ╔═╡ 8b2bd08c-866a-4c6e-a2fc-261dc8c05f2a
-# ╠═╡ disabled = true
-#=╠═╡
 chosen_maximizer = bellman_maximizer
-  ╠═╡ =#
 
 # ╔═╡ 73607123-a784-483e-9241-772e5937d59d
-# ╠═╡ disabled = true
-#=╠═╡
 perturbed_maximizer = PerturbedAdditive(chosen_maximizer; ε=ε, nb_samples=M)
-  ╠═╡ =#
 
 # ╔═╡ 13945989-fb32-4027-a67b-e2a9a9254446
 md"And define the associated Fenchel Young loss:"
 
 # ╔═╡ 2e926dc4-0f12-411e-85e2-5dcffdcc1266
-# ╠═╡ disabled = true
-#=╠═╡
 loss = FenchelYoungLoss(perturbed_maximizer)
-  ╠═╡ =#
 
 # ╔═╡ b7674b98-526c-40ee-bf83-a9d6e7be6e4f
 encoder = deepcopy(initial_encoder)
@@ -1310,6 +1296,9 @@ md"""
 From the generic definition of the pipeline we define a loss function compatible with `Flux.jl` package. Its definition depends on the learning setting we consider.
 In this subsection, we are in a learning by imitation setting
 """
+
+# ╔═╡ 9b351fbd-2820-4353-b3fa-ec0e6d07d861
+imitation_flux_loss(x, y, θ) = loss(encoder(x), y)
 
 # ╔═╡ b4451d05-1ac5-4962-88d8-e59d9ca225ea
 warning_box(md"If you want to use the `train_function!` generic function defined above, the loss needs to take as argument x, y and θ in this order, even if it does not use all of them.")
@@ -1329,6 +1318,18 @@ danger(md"Click the checkbox to activate the training cell $(@bind train CheckBo
 
 It may take some time to run and affect the reactivity of the notebook. Then you can read what follows.")
 
+# ╔═╡ 83a14158-33d1-4f16-85e1-2726c8fbbdfc
+loss_history, gap_history, final_encoder = train ? train_function!(;
+	encoder=encoder,
+	maximizer=chosen_maximizer,
+	loss=imitation_flux_loss,
+	train_data=train_dataset,
+	test_data=test_dataset,
+	lr_start=lr_start,
+	batch_size=batch_size,
+	nb_epoch=nb_epochs
+) : (zeros(nb_epochs, 2), zeros(nb_epochs + 1, 2), encoder);
+
 # ╔═╡ 4b31dca2-0195-4899-8a3a-e9772fabf495
 md"""
 #### 5) Plot results
@@ -1338,6 +1339,9 @@ md"""
 md"""
 Loss and gap over epochs, train and test datasets.
 """
+
+# ╔═╡ 66d385ba-9c6e-4378-b4e0-e54a4df346a5
+plot_loss_and_gap(loss_history, gap_history,nb_epochs,filepath="./add.png")
 
 # ╔═╡ db799fa2-0e48-43ee-9ee1-80ff8d2e5de7
 md"""
@@ -1353,11 +1357,45 @@ md"""
 # ╔═╡ 01a1fd52-ff6c-44c6-ab1a-d1c141a4d54e
 TwoColumn(md"Choose dataset you want to evaluate on:", md"""data = $(@bind data Select([train_dataset => "train", test_dataset => "test"]))""")
 
+# ╔═╡ 521f5ffa-2c22-44c5-8bdb-67410431ca2e
+begin
+	test_predictions_origin = []
+	dataset_to_test_origin = data
+	for (x, y_true, θ_true) in dataset_to_test 
+		θ₀ = initial_encoder(x)
+		y₀ = UInt8.(chosen_maximizer(θ₀))
+		θ = final_encoder(x)
+		y = UInt8.(chosen_maximizer(θ))
+		push!(test_predictions, (; x, y_true, θ_true, θ₀, y₀, θ, y))
+	end
+end
+
+# ╔═╡ f9b35e98-347f-4ebd-a690-790c7b0e03d8
+md"""
+``j =`` $(@bind j_origin Slider(1:length(dataset_to_test); default=1, show_value=true))
+"""
+
+# ╔═╡ a828548f-175b-4cf0-b0aa-d9eef0477f4d
+(; x, y_true, θ_true, θ₀, y₀, θ, y) = test_predictions[j_origin]
+
+# ╔═╡ a1043a1c-5840-4175-aa4a-ef432c353073
+plot_image_weights_path(x, y_true, θ_true)
+
 # ╔═╡ b1a44835-58d7-462f-a0d4-85bc02d3fdc6
 md"Predictions of the trained neural network:"
 
+# ╔═╡ 91e520aa-97a1-40b2-8936-93c93a63011c
+plot_image_weights_path(
+	x, y, -θ; θ_title="Predicted weights", y_title="Predicted path", θ_true=θ_true
+)
+
 # ╔═╡ 39daeb26-66d6-4a05-979f-76666444c73b
 md"Predictions of the initial untrained neural network:"
+
+# ╔═╡ 0e8ea002-6bc8-4684-a72a-f7d7062eecc0
+plot_image_weights_path(
+	x, y₀, -θ₀; θ_title="Initial predicted weights", y_title="Initial predicted path", θ_true=θ_true
+)
 
 # ╔═╡ 9a9b3942-72f2-4c9e-88a5-af927634468c
 md"""
@@ -1416,20 +1454,52 @@ TODO("Implement the training similarly to previous subsection, by using a multip
 # ╔═╡ 99468dd9-4b97-48e6-803b-489dc1cefdf8
 hint(md"You can modify the previous additive implementation below, by replacing the `PerturbedAdditive` regularization with a `PerturbedMultiplicative` one. You can also modify use `dijkstra_maximizer` instead of `belmann_maximizer` as the CO algorithm, which runs faster.")
 
-# ╔═╡ 29adae36-2053-4af9-8352-0eae8b67949c
-chosen_maximizer = dijkstra_maximizer
+# ╔═╡ 369ff5a9-5445-42a2-9198-deab459e7fef
+begin
+	chosen_maximizer_mul = dijkstra_maximizer
+	perturbed_maximizer_mul = PerturbedMultiplicative(chosen_maximizer_mul; ε=ε, nb_samples=M)
+	loss_mul = FenchelYoungLoss(perturbed_maximizer)
+	imitation_flux_loss_mul(x, y, θ) = loss_mul(encoder(x), y)
+	nb_epochs_mul = 40
+end
 
-# ╔═╡ c212342e-6ba0-436b-a7c3-058532552b84
-perturbed_maximizer = PerturbedMultiplicative(chosen_maximizer; ε=ε, nb_samples=M)
+# ╔═╡ a0cfb77a-2413-444e-9ed7-fd175a062011
+danger(md"Click the checkbox to activate the training cell $(@bind train_mul CheckBox()) 
 
-# ╔═╡ e52abadb-6acf-46f5-89ce-e3ce7cb9e114
-par = Flux.params(encoder)
+It may take some time to run and affect the reactivity of the notebook. Then you can read what follows.")
+
+# ╔═╡ 0750c00e-4f2c-4944-8dad-1457ab2ad0b7
+loss_history_mul, gap_history_mul, final_encoder_mul = train_mul ? train_function!(;
+	encoder=encoder,
+	maximizer=chosen_maximizer_mul,
+	loss=imitation_flux_loss_mul,
+	train_data=train_dataset,
+	test_data=test_dataset,
+	lr_start=lr_start,
+	batch_size=batch_size,
+	nb_epoch=nb_epochs_mul
+) : (zeros(nb_epochs_mul, 2), zeros(nb_epochs_mul + 1, 2), encoder);
+
+# ╔═╡ be29e844-06bc-40f1-b492-47bb436c8b39
+plot_loss_and_gap(loss_history_mul, gap_history_mul,nb_epochs_mul,filepath="./mul.png")
 
 # ╔═╡ f6d87e32-419a-48be-8054-f54fb6e4cef3
 question_box(md"Comment your experiments and results here")
 
 # ╔═╡ 8b46c5e6-f6ef-4372-a81d-d7eedb1a07d2
-still_missing(md"Write your answer here.")
+still_missing(md"
+Here we add the epoch to 40, and do not change other params.
+
+First we find that  although the methode of pertubation is different, using multiplicative pertubation results in nearly the same loss as the addictive pertubation.
+
+And the same as the addictive pertubation, before epoch 10, the loss and the gap reduces very fast, and after 10, it is getting more slowly. 
+")
+
+# ╔═╡ 80390db3-5df7-4d01-92bb-57a907e8804c
+load("./mul_save.png")
+
+# ╔═╡ bcbabc46-ec6f-47f4-a409-8c80692a3a94
+load("./add_save.png")
 
 # ╔═╡ 0fd29811-9e17-4c97-b9b7-ec9cc51b435f
 md"""
@@ -1442,35 +1512,41 @@ TODO(md"Replace the `FenchelYoungLoss` by a `SPOPlusLoss` in order to leverage t
 # ╔═╡ 7ccf487c-49a1-49e9-bc19-e2f4e8a7d331
 hint(md"You can replace the `FenchelYoungLoss` by `SPOPlusLoss(true_maximizer)`, we do not need to use the `Perturbed` here.")
 
-# ╔═╡ 45a82ad6-3a08-4dbf-9d01-02bdd746eda3
-true_maximizer = dijkstra_maximizer
+# ╔═╡ e4196044-659b-47b1-aef8-13ec85e78526
+begin
+	true_maximizer_SPOP = dijkstra_maximizer
+	loss_SPOP = SPOPlusLoss(true_maximizer_SPOP)
+	imitation_flux_loss_SPOP(x, y, θ) = loss_SPOP(encoder(x), y)
+	nb_epochs_SPOP = 20
+end
 
-# ╔═╡ 9b351fbd-2820-4353-b3fa-ec0e6d07d861
-imitation_flux_loss(x, y, θ) = loss(encoder(x), y)
+# ╔═╡ a48b7599-a437-4c71-8de3-2bfe180ed823
+danger(md"Click the checkbox to activate the training cell $(@bind train_SPOP CheckBox()) 
 
-# ╔═╡ 83a14158-33d1-4f16-85e1-2726c8fbbdfc
-loss_history, gap_history, final_encoder = train ? train_function!(;
+It may take some time to run and affect the reactivity of the notebook. Then you can read what follows.")
+
+# ╔═╡ ef21f3c7-3f68-4f50-938a-f447ad6ee132
+loss_history_SPOP, gap_history_SPOP, final_encoder_SPOP = train_SPOP ? train_function!(;
 	encoder=encoder,
-	maximizer=chosen_maximizer,
-	loss=imitation_flux_loss,
+	maximizer=true_maximizer_SPOP,
+	loss=imitation_flux_loss_SPOP,
 	train_data=train_dataset,
 	test_data=test_dataset,
 	lr_start=lr_start,
 	batch_size=batch_size,
-	nb_epoch=nb_epochs
-) : (zeros(nb_epochs, 2), zeros(nb_epochs + 1, 2), encoder);
+	nb_epoch=nb_epochs_SPOP
+) : (zeros(nb_epochs_SPOP, 2), zeros(nb_epochs_SPOP + 1, 2), encoder);
 
-# ╔═╡ 66d385ba-9c6e-4378-b4e0-e54a4df346a5
-plot_loss_and_gap(loss_history, gap_history)
-
-# ╔═╡ dfaa19a4-aca9-417d-942c-cb787c449a3e
-batch_loss(batch) = sum(loss(item...) for item in batch)
+# ╔═╡ b3c69db7-4c18-4cbb-80a6-731c6f32663e
+plot_loss_and_gap(loss_history_SPOP, gap_history_SPOP,nb_epochs_SPOP,filepath="./SPOP.png")
 
 # ╔═╡ 8bb55d7e-1817-4b81-8de6-ad31191d08e8
 question_box(md"Comment your experiments and results here")
 
 # ╔═╡ 8c320286-3c34-4e68-8b9c-4dcf81be1a45
-still_missing(md"Write your answer here.")
+still_missing(md"
+For this part, we only change the loss function but we don't have enough memory to run even 1 epoch when using SPOPlussLoss with the dijkstra_maximizer.
+")
 
 # ╔═╡ 90a47e0b-b911-4728-80b5-6ed74607833d
 md"""
@@ -1488,56 +1564,12 @@ TODO(md"Modify the code above to learn by experience using a multiplicative pert
 # ╔═╡ 4625c35f-cd2d-4883-838a-57276e83d241
 hint(md"Use the `PushForward` wrapper to define a learn by experience loss.")
 
-# ╔═╡ 0ddf43c5-6ba0-4d22-80ad-6ca8cf92f69a
-perturbed_mult_exp = PerturbedMultiplicative(chosen_maximizer; ε=ε, nb_samples=M)
-
 # ╔═╡ dd33c5fd-6c9a-4fec-94a4-8f2473b9c846
-regret_loss = Pushforward(perturbed_mult_exp,cost)
-
-# ╔═╡ a2e9944e-6034-4450-bda4-ac74875cdfca
-experience_flux_loss(x, y, θ) = regret_loss(encoder(x);c_true=θ)
-
-# ╔═╡ c7ce7967-09f7-4d77-bf57-fc8799b16da0
-function train_function_exp!(;
-	encoder, loss, train_data, test_data, lr_start, nb_epoch, batch_size, maximizer
-)
-	# batch stuff
-	batch_loss(batch) = sum(loss(item...) for item in batch)
-	train_dataset = Flux.DataLoader(train_data; batchsize=batch_size)
-	test_dataset = Flux.DataLoader(test_data; batchsize=length(test_data))
-
-	# Store the train loss and gap metric
-	losses = Matrix{Float64}(undef, nb_epochs, 2)
-	cost_gaps = Matrix{Float64}(undef, nb_epochs + 1, 2)
-
-	# Optimizer
-	opt = ADAM(lr_start)
-
-	# model parameters
-	par = Flux.params(encoder)
-
-	cost_gaps[1, 1] = shortest_path_cost_gap(; model=encoder, dataset=train_dataset, maximizer)
-	cost_gaps[1, 2] = shortest_path_cost_gap(; model=encoder, dataset=test_dataset, maximizer)
-
-	# Train loop
-	@progress "Training epoch: " for epoch in 1:nb_epochs
-		train_loss = 0.0
-		for batch in train_dataset
-			loss_value = 0
-			gs = gradient(par) do
-				loss_value = batch_loss(batch)
-			end
-			train_loss += loss_value
-			Flux.update!(opt, par, gs)
-		end
-
-		# compute and store epoch metrics
-		losses[epoch, 1] = train_loss / (nb_samples * train_prop)
-		losses[epoch, 2] = sum([batch_loss(batch) for batch in test_dataset]) / (nb_samples * (1 - train_prop))
-		cost_gaps[epoch + 1, 1] = shortest_path_cost_gap(; model=encoder, dataset=train_dataset, maximizer)
-		cost_gaps[epoch + 1, 2] = shortest_path_cost_gap(; model=encoder, dataset=test_dataset, maximizer)
-	end
-	 return losses, cost_gaps, deepcopy(encoder)
+begin
+	perturbed_mult_exp = PerturbedMultiplicative(chosen_maximizer; ε=ε, nb_samples=M)
+	regret_loss = Pushforward(perturbed_mult_exp,cost)
+	experience_flux_loss(x, y, θ) = regret_loss(encoder(x);c_true=θ)
+	nb_epochs_exp = 40
 end
 
 # ╔═╡ b5041d8a-605b-45d2-bc09-927f5c244336
@@ -1546,7 +1578,7 @@ danger(md"Click the checkbox to activate the training cell $(@bind train_exp Che
 It may take some time to run and affect the reactivity of the notebook. Then you can read what follows.")
 
 # ╔═╡ dc1e46f7-a94d-4242-ba66-753eac411c63
-loss_history_exp, gap_history_exp, final_encoder_exp = train_exp ? train_function_exp!(;
+loss_history_exp, gap_history_exp, final_encoder_exp = train_exp ? train_function!(;
 	encoder=encoder,
 	maximizer=chosen_maximizer,
 	loss=experience_flux_loss,
@@ -1554,46 +1586,28 @@ loss_history_exp, gap_history_exp, final_encoder_exp = train_exp ? train_functio
 	test_data=test_dataset,
 	lr_start=lr_start,
 	batch_size=batch_size,
-	nb_epoch=nb_epochs
-) : (zeros(nb_epochs, 2), zeros(nb_epochs + 1, 2), encoder);
+	nb_epoch=nb_epochs_exp
+) : (zeros(nb_epochs_exp, 2), zeros(nb_epochs_exp + 1, 2), encoder);
 
 # ╔═╡ 75beaa0d-b51d-4da0-9f5b-ed7d991cc886
-plot_loss_and_gap(loss_history_exp, gap_history_exp)
-
-# ╔═╡ a828548f-175b-4cf0-b0aa-d9eef0477f4d
-(; x, y_true, θ_true, θ₀, y₀, θ, y) = test_predictions[j]
-
-# ╔═╡ a1043a1c-5840-4175-aa4a-ef432c353073
-plot_image_weights_path(x, y_true, θ_true)
-
-# ╔═╡ 91e520aa-97a1-40b2-8936-93c93a63011c
-plot_image_weights_path(
-	x, y, -θ; θ_title="Predicted weights", y_title="Predicted path", θ_true=θ_true
-)
-
-# ╔═╡ 0e8ea002-6bc8-4684-a72a-f7d7062eecc0
-plot_image_weights_path(
-	x, y₀, -θ₀; θ_title="Initial predicted weights", y_title="Initial predicted path", θ_true=θ_true
-)
-
-# ╔═╡ 6df5e942-4e45-4f06-aebf-fb33c1aec86f
-plot_image_weights_path(x, y_true, θ_true)
-
-# ╔═╡ f5e1313c-28f3-451d-ac51-8a304793b9d9
-plot_image_weights_path(
-	x, y, -θ; θ_title="Predicted weights", y_title="Predicted path", θ_true=θ_true
-)
-
-# ╔═╡ a1d5da7b-0381-4cd7-9008-1aea802e415a
-plot_image_weights_path(
-	x, y₀, -θ₀; θ_title="Initial predicted weights", y_title="Initial predicted path", θ_true=θ_true
-)
+plot_loss_and_gap(loss_history_exp, gap_history_exp,nb_epochs_exp,filepath="./exp.png")
 
 # ╔═╡ 00cb431b-dced-45fd-a191-12bd59a096f5
 question_box(md"Comment your experiments and results here")
 
+# ╔═╡ cb74e096-40e2-4f05-98d3-e11161cb79d4
+load("./exp_save.png")
+
 # ╔═╡ 2844aedb-73cf-420d-bbc0-8a74c4133eea
-still_missing(md"Write your answer here.")
+still_missing(md"
+Here in this experiment for learning by experience, we use the same params as the learning by imitation part.
+
+Comparing with the method of learning by imitation, learning by experience has a **worse** performance with the sames parametres. Before the first 10 epochs, the loss and gap reduce very fast. And after 30 epochs, they barely reduce.
+
+The loss stays at around 34 and the gap keeps at around 10. Comparing with the result of learning by imitation, the result is very bad.
+
+The reason may be that the learning by experience does not use the true label information....你搜搜都可能因为什么
+")
 
 # ╔═╡ a5bfd185-aa77-4e46-a6b6-d43c4785a7fa
 md"""
@@ -1623,60 +1637,13 @@ begin
 	)
 end;
 
-# ╔═╡ 93ce4cf8-0cdb-46d1-b768-aaceebb39556
-regularized = RegularizedFrankWolfe(bellman_maximizer; Ω=scaled_half_square_norm, Ω_grad=grad_scaled_half_square_norm,frank_wolfe_kwargs=frank_wolfe_kwargs)
-
 # ╔═╡ d7292433-f267-453f-8eef-a7f1ce6eec1e
-regret_reg = Pushforward(regularized, cost)
-
-# ╔═╡ c646e0ca-9235-4e99-89aa-4824d9cd1730
-experience_flux_loss_reg(x, y, θ) = regret_reg(encoder(x);c_true=θ)
-
-# ╔═╡ b428ae72-a60d-457b-a2ee-7760013f87d8
-function train_function_exp_reg!(;
-	encoder, loss, train_data, test_data, lr_start, nb_epoch, batch_size, maximizer
-)
-	# batch stuff
-	batch_loss(batch) = sum(loss(item...) for item in batch)
-	train_dataset = Flux.DataLoader(train_data; batchsize=batch_size)
-	test_dataset = Flux.DataLoader(test_data; batchsize=length(test_data))
-
-	# Store the train loss and gap metric
-	losses = Matrix{Float64}(undef, nb_epochs, 2)
-	cost_gaps = Matrix{Float64}(undef, nb_epochs + 1, 2)
-
-	# Optimizer
-	opt = ADAM(lr_start)
-
-	# model parameters
-	par = Flux.params(encoder)
-
-	cost_gaps[1, 1] = shortest_path_cost_gap(; model=encoder, dataset=train_dataset, maximizer)
-	cost_gaps[1, 2] = shortest_path_cost_gap(; model=encoder, dataset=test_dataset, maximizer)
-
-	# Train loop
-	@progress "Training epoch: " for epoch in 1:nb_epochs
-		train_loss = 0.0
-		
-		for batch in train_dataset
-			
-			loss_value = 0
-			gs = gradient(par) do
-				@info "" j=1
-				loss_value = batch_loss(batch)
-			end
-			train_loss += loss_value
-			@info "" j=2
-			Flux.update!(opt, par, gs)
-		end
-
-		# compute and store epoch metrics
-		losses[epoch, 1] = train_loss / (nb_samples * train_prop)
-		losses[epoch, 2] = sum([batch_loss(batch) for batch in test_dataset]) / (nb_samples * (1 - train_prop))
-		cost_gaps[epoch + 1, 1] = shortest_path_cost_gap(; model=encoder, dataset=train_dataset, maximizer)
-		cost_gaps[epoch + 1, 2] = shortest_path_cost_gap(; model=encoder, dataset=test_dataset, maximizer)
-	end
-	 return losses, cost_gaps, deepcopy(encoder)
+begin
+	chosen_maximizer_reg = bellman_maximizer
+	regularized = RegularizedFrankWolfe(chosen_maximizer_reg; Ω=scaled_half_square_norm, Ω_grad=grad_scaled_half_square_norm,frank_wolfe_kwargs=frank_wolfe_kwargs)
+	regret_reg = Pushforward(regularized, cost)
+	experience_flux_loss_reg(x, y, θ) = regret_reg(encoder(x);c_true=θ)
+	nb_epochs_reg=40
 end
 
 # ╔═╡ 9a363e0e-2893-4fdb-a787-7e1f54b3e7c6
@@ -1685,7 +1652,7 @@ danger(md"Click the checkbox to activate the training cell $(@bind train_exp_reg
 It may take some time to run and affect the reactivity of the notebook. Then you can read what follows.")
 
 # ╔═╡ 6d06c9b5-170d-402a-b105-55ed22614f3f
-loss_history_exp_reg, gap_history_exp_reg, final_encoder_exp_reg = train_exp_reg ? train_function_exp_reg!(;
+loss_history_exp_reg, gap_history_exp_reg, final_encoder_exp_reg = train_exp_reg ? train_function!(;
 	encoder=encoder,
 	maximizer=chosen_maximizer,
 	loss=experience_flux_loss_reg,
@@ -1693,59 +1660,20 @@ loss_history_exp_reg, gap_history_exp_reg, final_encoder_exp_reg = train_exp_reg
 	test_data=test_dataset,
 	lr_start=lr_start,
 	batch_size=batch_size,
-	nb_epoch=nb_epochs
-) : (zeros(nb_epochs, 2), zeros(nb_epochs + 1, 2), encoder);
+	nb_epoch=nb_epochs_reg
+) : (zeros(nb_epochs_reg, 2), zeros(nb_epochs_reg + 1, 2), encoder);
+
+# ╔═╡ a583e66d-7aa3-4c67-ab3d-e8b86951cb8a
+plot_loss_and_gap(loss_history_exp_reg, gap_history_exp_reg,nb_epochs_reg,filepath="./reg_save.png")
 
 # ╔═╡ b0769c65-9b86-496e-85fc-a8dc43c55576
 question_box(md"Comment your experiments and results here")
 
+# ╔═╡ 24904eb4-2395-42cd-83f5-950d31ec3fb6
+
+
 # ╔═╡ d4a3de84-668d-4a89-b677-2a6cd2c24bb6
 still_missing(md"Write your answer here.")
-
-# ╔═╡ 1635113f-200e-4c1a-a9f6-446748f71d73
-md"""
-``j =`` $(@bind j Slider(1:length(dataset_to_test); default=1, show_value=true))
-"""
-
-# ╔═╡ 52690a7a-8361-4f26-bfbd-5dda931e7020
-begin
-	test_predictions = []
-	dataset_to_test = data
-	for (x, y_true, θ_true) in dataset_to_test 
-		θ₀ = initial_encoder(x)
-		y₀ = UInt8.(chosen_maximizer(θ₀))
-		θ = final_encoder(x)
-		y = UInt8.(chosen_maximizer(θ))
-		push!(test_predictions, (; x, y_true, θ_true, θ₀, y₀, θ, y))
-	end
-end
-
-# ╔═╡ 521f5ffa-2c22-44c5-8bdb-67410431ca2e
-begin
-	test_predictions = []
-	dataset_to_test = data
-	for (x, y_true, θ_true) in dataset_to_test 
-		θ₀ = initial_encoder(x)
-		y₀ = UInt8.(chosen_maximizer(θ₀))
-		θ = final_encoder(x)
-		y = UInt8.(chosen_maximizer(θ))
-		push!(test_predictions, (; x, y_true, θ_true, θ₀, y₀, θ, y))
-	end
-end
-
-# ╔═╡ 0a0e7b32-e1f4-4d5c-8ebc-b5d06b61e6df
-# ╠═╡ disabled = true
-#=╠═╡
-loss = FenchelYoungLoss(perturbed_maximizer)
-  ╠═╡ =#
-
-# ╔═╡ 27b58022-9e2e-4be6-9040-0fd0a70907b4
-loss = SPOPlusLoss(true_maximizer)
-
-# ╔═╡ f9b35e98-347f-4ebd-a690-790c7b0e03d8
-md"""
-``j =`` $(@bind j Slider(1:length(dataset_to_test); default=1, show_value=true))
-"""
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
@@ -4227,7 +4155,6 @@ version = "1.4.1+1"
 # ╟─f13bf21c-33db-4620-add8-bfd82f493d7c
 # ╟─f99d6992-dc3e-41d1-8922-4958886dade2
 # ╠═0d20da65-1e53-4b6e-b302-28243c94fb4c
-# ╠═3a3f0805-b720-411c-ad2b-4c311860e06d
 # ╠═87040fd6-bd1a-47dd-875c-2caf5b50d2ce
 # ╟─53f7468d-0015-4339-8e27-48812f541329
 # ╟─81cd64c4-f317-4555-ab7a-9a5b2b837b91
@@ -4275,7 +4202,7 @@ version = "1.4.1+1"
 # ╠═0a10bc50-9129-4ada-9c8f-28645b766181
 # ╟─3a84fd20-41fa-4156-9be5-a0371754b394
 # ╟─ee87d357-318f-40f1-a82a-fe680286e6cd
-# ╟─5c231f46-02b0-43f9-9101-9eb222cff972
+# ╠═5c231f46-02b0-43f9-9101-9eb222cff972
 # ╟─94192d5b-c4e9-487f-a36d-0261d9e86801
 # ╟─98eb10dd-a4a1-4c91-a0cd-dd1d1e6bc89a
 # ╠═8d2ac4c8-e94f-488e-a1fa-611b7b37fcea
@@ -4297,7 +4224,7 @@ version = "1.4.1+1"
 # ╟─0514cde6-b425-4fe7-ac1e-2678b64bbee5
 # ╟─caf02d68-3418-4a6a-ae25-eabbbc7cae3f
 # ╟─61db4159-84cd-4e3d-bc1e-35b35022b4be
-# ╟─08ea0d7e-2ffe-4f2e-bd8c-f15f9af0f35b
+# ╠═08ea0d7e-2ffe-4f2e-bd8c-f15f9af0f35b
 # ╟─d58098e8-bba5-445c-b1c3-bfb597789916
 # ╟─a0644bb9-bf62-46aa-958e-aeeaaba3482e
 # ╠═eaf0cf1f-a7be-4399-86cc-66c131a57e44
@@ -4370,7 +4297,7 @@ version = "1.4.1+1"
 # ╟─b4451d05-1ac5-4962-88d8-e59d9ca225ea
 # ╟─58b7267d-491d-40f0-b4ba-27ed0c9cc855
 # ╟─ac76b646-7c28-4384-9f04-5e4de5df154f
-# ╟─effbea0f-e9af-469c-a792-10078da46b39
+# ╠═effbea0f-e9af-469c-a792-10078da46b39
 # ╠═83a14158-33d1-4f16-85e1-2726c8fbbdfc
 # ╟─4b31dca2-0195-4899-8a3a-e9772fabf495
 # ╟─79e0deab-1e36-4863-ad10-187ed8555c72
@@ -4388,57 +4315,52 @@ version = "1.4.1+1"
 # ╠═0e8ea002-6bc8-4684-a72a-f7d7062eecc0
 # ╟─9a9b3942-72f2-4c9e-88a5-af927634468c
 # ╟─1ff198ea-afd5-4acc-bb67-019051ff149b
-# ╠═44ece9ce-f9f1-46f3-90c6-cb0502c92c67
+# ╟─44ece9ce-f9f1-46f3-90c6-cb0502c92c67
 # ╠═202f60d2-136c-44f1-93f6-33e68d4b5417
 # ╟─5fe95aa5-f670-4329-a933-240a8c074dea
 # ╟─43907e7e-8399-4edd-b3cf-0637064e72a6
 # ╟─43d68541-84a5-4a63-9d8f-43783cc27ccc
 # ╟─5c6d39b0-9942-4173-9455-39cb3c174873
 # ╟─99468dd9-4b97-48e6-803b-489dc1cefdf8
-# ╠═29adae36-2053-4af9-8352-0eae8b67949c
-# ╠═c212342e-6ba0-436b-a7c3-058532552b84
-# ╠═0a0e7b32-e1f4-4d5c-8ebc-b5d06b61e6df
-# ╠═dfaa19a4-aca9-417d-942c-cb787c449a3e
-# ╠═e52abadb-6acf-46f5-89ce-e3ce7cb9e114
+# ╠═369ff5a9-5445-42a2-9198-deab459e7fef
+# ╠═a0cfb77a-2413-444e-9ed7-fd175a062011
+# ╠═0750c00e-4f2c-4944-8dad-1457ab2ad0b7
+# ╠═be29e844-06bc-40f1-b492-47bb436c8b39
 # ╟─f6d87e32-419a-48be-8054-f54fb6e4cef3
 # ╠═8b46c5e6-f6ef-4372-a81d-d7eedb1a07d2
+# ╠═80390db3-5df7-4d01-92bb-57a907e8804c
+# ╠═bcbabc46-ec6f-47f4-a409-8c80692a3a94
 # ╠═0fd29811-9e17-4c97-b9b7-ec9cc51b435f
 # ╟─71726572-0341-4344-9a3f-410d3bbc430a
 # ╟─7ccf487c-49a1-49e9-bc19-e2f4e8a7d331
-# ╠═45a82ad6-3a08-4dbf-9d01-02bdd746eda3
-# ╠═27b58022-9e2e-4be6-9040-0fd0a70907b4
+# ╠═e4196044-659b-47b1-aef8-13ec85e78526
+# ╠═a48b7599-a437-4c71-8de3-2bfe180ed823
+# ╠═ef21f3c7-3f68-4f50-938a-f447ad6ee132
+# ╠═b3c69db7-4c18-4cbb-80a6-731c6f32663e
 # ╟─8bb55d7e-1817-4b81-8de6-ad31191d08e8
 # ╠═8c320286-3c34-4e68-8b9c-4dcf81be1a45
 # ╟─90a47e0b-b911-4728-80b5-6ed74607833d
 # ╟─5d79b8c1-beea-4ff9-9830-0f5e1c4ef29f
 # ╟─418755cb-765f-4a8c-805d-ceac36c7706c
 # ╟─4625c35f-cd2d-4883-838a-57276e83d241
-# ╠═0ddf43c5-6ba0-4d22-80ad-6ca8cf92f69a
 # ╠═dd33c5fd-6c9a-4fec-94a4-8f2473b9c846
-# ╠═a2e9944e-6034-4450-bda4-ac74875cdfca
-# ╠═c7ce7967-09f7-4d77-bf57-fc8799b16da0
 # ╟─b5041d8a-605b-45d2-bc09-927f5c244336
 # ╠═dc1e46f7-a94d-4242-ba66-753eac411c63
 # ╠═75beaa0d-b51d-4da0-9f5b-ed7d991cc886
-# ╠═52690a7a-8361-4f26-bfbd-5dda931e7020
-# ╠═6df5e942-4e45-4f06-aebf-fb33c1aec86f
-# ╠═1635113f-200e-4c1a-a9f6-446748f71d73
-# ╠═f5e1313c-28f3-451d-ac51-8a304793b9d9
-# ╠═a1d5da7b-0381-4cd7-9008-1aea802e415a
 # ╟─00cb431b-dced-45fd-a191-12bd59a096f5
+# ╠═cb74e096-40e2-4f05-98d3-e11161cb79d4
 # ╠═2844aedb-73cf-420d-bbc0-8a74c4133eea
 # ╟─a5bfd185-aa77-4e46-a6b6-d43c4785a7fa
 # ╟─a7b6ecbd-1407-44dd-809e-33311970af12
 # ╟─a96e6942-06ab-42d3-a7e5-9c431a676d15
 # ╟─201ec4fd-01b1-49c4-a104-3d619ffb447b
 # ╠═8b544491-b892-499f-8146-e7d1f02aaac1
-# ╠═93ce4cf8-0cdb-46d1-b768-aaceebb39556
 # ╠═d7292433-f267-453f-8eef-a7f1ce6eec1e
-# ╠═c646e0ca-9235-4e99-89aa-4824d9cd1730
-# ╠═b428ae72-a60d-457b-a2ee-7760013f87d8
 # ╠═9a363e0e-2893-4fdb-a787-7e1f54b3e7c6
 # ╠═6d06c9b5-170d-402a-b105-55ed22614f3f
+# ╠═a583e66d-7aa3-4c67-ab3d-e8b86951cb8a
 # ╟─b0769c65-9b86-496e-85fc-a8dc43c55576
+# ╠═24904eb4-2395-42cd-83f5-950d31ec3fb6
 # ╠═d4a3de84-668d-4a89-b677-2a6cd2c24bb6
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
